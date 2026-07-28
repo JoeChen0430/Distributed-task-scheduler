@@ -113,3 +113,24 @@ async def mark_task_failed(pool: asyncpg.Pool, task_id: int, error: str) -> None
         """,
         task_id, error,
     )
+
+
+async def mark_tasks_blocked(pool: asyncpg.Pool, task_ids: list[int]) -> None:
+    """Mark a batch of tasks BLOCKED because an upstream dependency failed.
+
+    Unlike claim_task(), there's no race to win here: blocking isn't a claim on
+    work to execute, it's bookkeeping the scheduler derives from graph state. So
+    a plain bulk UPDATE is enough — no atomic check-and-flip needed. The
+    WHERE status = 'pending' guard is just belt-and-suspenders: it stops us ever
+    stomping a task that meanwhile reached a real terminal state.
+    """
+    if not task_ids:
+        return
+    await pool.execute(
+        """
+        UPDATE tasks
+        SET status = 'blocked', finished_at = now()
+        WHERE id = ANY($1::int[]) AND status = 'pending'
+        """,
+        task_ids,
+    )

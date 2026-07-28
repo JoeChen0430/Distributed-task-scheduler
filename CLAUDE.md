@@ -9,7 +9,10 @@ Distributed Task Scheduler — a DAG-based task scheduler (simplified Airflow), 
 This project is deliberately built phase-by-phase. **Don't skip ahead or add later-phase features early**, even if it would make the code more "complete" — that defeats the point of the exercise. If you're working on something and notice a gap that belongs to a later phase, flag it, don't fix it inline.
 
 - **Phase 1 (single-process): done.** Scheduler runs a DAG end-to-end on one machine.
-- **Phase 2 (retry, timeout, failure propagation): not started.**
+- **Phase 2 (retry, timeout, failure propagation): in progress.**
+  - ✅ Failure propagation: failed task's descendants are marked `BLOCKED` (a terminal status) so the DAG finishes instead of hanging. See `graph.compute_blocked_tasks`.
+  - ⬜ Retry (with backoff): not started.
+  - ⬜ Timeout on stuck tasks: not started.
 - **Phase 3 (multi-worker via Redis): not started.**
 - **Phase 4 (React dashboard): not started.**
 - **Phase 5 (benchmark): not started.**
@@ -43,9 +46,9 @@ docker compose down -v && docker compose up -d && python -m scripts.migrate
 - `src/task_registry.py` — maps `task_type` strings to handler functions via `@register_task("name")`. New task types register here, not by editing the scheduler.
 - Task status strings always come from `src.models.TaskStatus` — never hardcode `"pending"` / `"success"` etc. as bare strings in new code.
 
-## Known intentional gap — do not silently "fix" this
+## Failure propagation (fixed in Phase 2)
 
-If a task fails, its descendants stay `PENDING` forever (dependency resolution requires `SUCCESS`, not just "terminal"). This means `scheduler.run_dag`'s loop never exits on its own after a failure. This is documented in `graph.py`'s docstring and is **intentionally left for Phase 2** (needs a "blocked"/cancelled status and a way to propagate failure down the graph). Don't patch this as a drive-by fix — wait until Phase 2 actually starts so it gets designed properly instead of bolted on.
+Previously a failed task left its descendants stuck in `PENDING` forever and `run_dag`'s loop never exited. Fixed: `graph.compute_blocked_tasks` (pure logic, mirrors `compute_ready_tasks`) computes the transitive set of doomed pending tasks, and the scheduler persists them as `BLOCKED` via `db.mark_tasks_blocked` each loop. `BLOCKED` is a terminal status, so `is_dag_finished` now returns True and the DAG ends cleanly. See `examples/failing_dag.py` for a demo.
 
 ## Adding a new task type
 

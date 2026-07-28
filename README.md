@@ -1,25 +1,27 @@
-# Distributed Task Scheduler — Phase 1
+# Distributed Task Scheduler — Phase 2 (in progress)
 
 A minimal DAG-based task scheduler, built in phases so each distributed
 systems concept gets introduced one at a time instead of all at once.
 
-**This is Phase 1: single-process, single-machine.** The goal is to get the
-core idea — define a DAG, resolve dependencies, run tasks in the right order,
-see status per task — fully working before any of the "distributed" part
-(multiple workers, Redis, locking) gets added in Phase 3.
+**Phase 1 (single-process, single-machine) is done**: define a DAG, resolve
+dependencies, run tasks in the right order, see status per task. **Phase 2 is
+now in progress** — hardening how the scheduler handles things going wrong,
+starting with failure propagation. The "distributed" part (multiple workers,
+Redis, locking) still comes later in Phase 3.
 
-## What's in Phase 1 vs. what's coming later
+## What works vs. what's coming later
 
-| Concept | Phase 1 | Later |
+| Concept | Status | Notes |
 |---|---|---|
-| Define a DAG (tasks + dependencies) | ✅ Postgres tables | — |
-| Resolve "what's ready to run" | ✅ `src/graph.py` | — |
-| Run tasks concurrently | ✅ `asyncio.create_task` | — |
-| Prevent double-execution | ✅ atomic claim (`db.claim_task`) | Phase 3: matters across *processes*, not just within one |
-| Retry on failure | ❌ not yet | Phase 2 |
-| Timeout on stuck tasks | ❌ not yet | Phase 2 |
-| Multiple worker processes/machines | ❌ not yet (single process) | Phase 3: Redis-backed queue |
-| Web dashboard | ❌ not yet | Phase 4 |
+| Define a DAG (tasks + dependencies) | ✅ Phase 1 | Postgres tables |
+| Resolve "what's ready to run" | ✅ Phase 1 | `src/graph.py` |
+| Run tasks concurrently | ✅ Phase 1 | `asyncio.create_task` |
+| Prevent double-execution | ✅ Phase 1 | atomic claim (`db.claim_task`); matters across *processes* in Phase 3 |
+| Failure propagation (a failed task doesn't hang the DAG) | ✅ Phase 2 | doomed tasks marked `blocked`; `graph.compute_blocked_tasks` |
+| Retry on failure | ⬜ Phase 2 | not started |
+| Timeout on stuck tasks | ⬜ Phase 2 | not started |
+| Multiple worker processes/machines | ⬜ Phase 3 | Redis-backed queue |
+| Web dashboard | ⬜ Phase 4 | — |
 
 ## Project structure
 
@@ -27,17 +29,19 @@ see status per task — fully working before any of the "distributed" part
 distributed-task-scheduler/
 ├── docker-compose.yml       # Postgres for local dev
 ├── migrations/
-│   └── 001_init_schema.sql  # dag_runs / tasks / task_dependencies tables
+│   ├── 001_init_schema.sql       # dag_runs / tasks / task_dependencies tables
+│   └── 002_add_blocked_status.sql # Phase 2: adds the 'blocked' task status
 ├── src/
 │   ├── config.py            # reads DATABASE_URL from .env
 │   ├── models.py            # TaskStatus enum — the vocabulary everything shares
-│   ├── graph.py              # PURE logic: "which tasks are ready to run?" (no DB, unit-testable)
+│   ├── graph.py              # PURE logic: which tasks are ready / which are blocked? (no DB, unit-testable)
 │   ├── task_registry.py     # maps task_type strings -> Python functions
 │   ├── db.py                 # the only file that talks to Postgres
 │   ├── dag.py                 # helper to build a DAG from a list of task defs
 │   └── scheduler.py         # the polling loop that ties it all together
 ├── examples/
-│   └── etl_dag.py            # runnable example: extract -> transform -> validate -> load
+│   ├── etl_dag.py            # runnable example: extract -> transform -> validate -> load
+│   └── failing_dag.py        # Phase 2 demo: a failing task blocks its descendants, DAG still finishes
 ├── scripts/
 │   └── migrate.py            # applies migrations/*.sql without needing the psql CLI
 └── tests/
@@ -87,6 +91,23 @@ Peek at the data directly any time with:
 docker compose exec postgres psql -U scheduler -d scheduler -c "SELECT name, status, result FROM tasks ORDER BY id;"
 ```
 
+### Seeing failure propagation (Phase 2)
+
+`examples/failing_dag.py` is the same 4-step pipeline, but `transform` raises on
+purpose. In Phase 1 this would hang forever (`validate`/`load` stuck PENDING).
+Now the doomed tasks are marked `blocked` and the scheduler exits on its own:
+
+```bash
+python -m examples.failing_dag
+```
+```
+  -> running 'transform' (id=...)
+  <- 'transform' FAILED: row 42 has a null where a number was required
+  ~ 'validate' blocked (upstream failed)
+  ~ 'load' blocked (upstream failed)
+[scheduler] dag_run=... finished        # exits cleanly — no Ctrl+C needed
+```
+
 ### Re-running from scratch
 
 The migration script isn't idempotent yet (a deliberate simplification for
@@ -106,7 +127,7 @@ python -m pytest tests/
 These only exercise `src/graph.py` — no Postgres needed, since that module
 takes plain dicts in and returns plain lists out.
 
-## Two ideas worth understanding before Phase 2
+## Two ideas worth understanding
 
 **1. Why `graph.py` has zero database code.**
 The "which tasks are ready?" question is pure logic — given statuses and
@@ -126,12 +147,12 @@ need to touch this function at all to become safe with multiple workers.
 
 ## Known gaps in this version (see inline comments for details)
 
-- A failed task permanently blocks its descendants, and the scheduler loop
-  never exits on its own in that case (see the docstring on
-  `graph.is_dag_finished`). For now: Ctrl+C. Phase 2 is the natural place to
-  fix this properly.
-- No retry, no timeout — a slow or hung task just runs forever.
-- Migrations aren't versioned/idempotent.
+- ~~A failed task hangs the DAG forever.~~ **Fixed in Phase 2** — doomed tasks
+  are marked `blocked` (see `graph.compute_blocked_tasks`) so the run finishes.
+- No retry, no timeout — a slow or hung task just runs forever. (Next up in Phase 2.)
+- Migrations aren't versioned/idempotent, so applying a *new* migration means a
+  reset (see "Re-running from scratch"). Individual files use `IF NOT EXISTS`
+  where they can, but the runner still replays every file.
 
 None of these are bugs to panic about — they're the reason Phase 2 and 3
 exist. Building the naive version first, then noticing exactly where it

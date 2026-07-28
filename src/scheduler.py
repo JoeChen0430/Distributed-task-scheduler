@@ -14,6 +14,7 @@ for a Redis-backed queue once this version's limits (see below) start to hurt.
 import asyncio
 
 from src import db, graph, task_registry
+from src.models import TaskStatus
 
 
 async def execute_task(pool, task_row: dict) -> None:
@@ -45,6 +46,19 @@ async def run_dag(pool, dag_run_id: int, poll_interval: float = 1.0) -> None:
 
     while True:
         tasks, deps = await db.fetch_dag_state(pool, dag_run_id)
+
+        # Phase 2 — failure propagation. Any pending task whose dependency has
+        # failed (or was itself blocked) can never become ready, so mark it
+        # blocked now. Without this a failed task leaves its descendants stuck in
+        # PENDING and the loop below would spin forever (the Phase 1 gap).
+        blocked_ids = graph.compute_blocked_tasks(tasks, deps)
+        if blocked_ids:
+            await db.mark_tasks_blocked(pool, blocked_ids)
+            newly_blocked = set(blocked_ids)
+            for t in tasks:
+                if t["id"] in newly_blocked:
+                    t["status"] = TaskStatus.BLOCKED.value  # keep local view in sync
+                    print(f"  ~ '{t['name']}' blocked (upstream failed)")
 
         if graph.is_dag_finished(tasks) and not in_flight:
             print(f"[scheduler] dag_run={dag_run_id} finished")
