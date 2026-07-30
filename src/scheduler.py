@@ -13,21 +13,49 @@ for a Redis-backed queue once this version's limits (see below) start to hurt.
 
 import asyncio
 
-from src import db, graph, task_registry
+from src import db, graph, retry, task_registry
 from src.models import TaskStatus
 
 
 async def execute_task(pool, task_row: dict) -> None:
-    """Run one task's handler and persist the outcome. No retry yet (Phase 2)."""
+    """Run one task's handler and persist the outcome.
+
+    A per-task timeout_seconds bounds how long the handler may run — asyncio
+    cancels it if it overruns (this only works while the handler awaits, i.e.
+    cooperative cancellation). A timeout and a raised exception both funnel into
+    the SAME path: retry with exponential backoff up to max_retries, and only
+    once retries are exhausted is the task marked FAILED for real (which is what
+    then triggers graph.compute_blocked_tasks to block its descendants).
+    """
     handler = task_registry.get_handler(task_row["task_type"])
+    timeout = task_row["timeout_seconds"]
     print(f"  -> running '{task_row['name']}' (id={task_row['id']})")
     try:
-        result = await handler({"task": task_row})
+        coro = handler({"task": task_row})
+        if timeout is not None:
+            result = await asyncio.wait_for(coro, timeout=timeout)
+        else:
+            result = await coro
         await db.mark_task_success(pool, task_row["id"], result or {})
         print(f"  <- '{task_row['name']}' succeeded: {result}")
+        return
+    except asyncio.TimeoutError:
+        reason = f"timed out after {timeout}s"
     except Exception as exc:
-        await db.mark_task_failed(pool, task_row["id"], str(exc))
-        print(f"  <- '{task_row['name']}' FAILED: {exc}")
+        reason = str(exc)
+
+    # Reached only on failure/timeout — one shared decision: retry or give up.
+    delay = retry.plan_retry(task_row["retry_count"], task_row["max_retries"])
+    if delay is None:
+        await db.mark_task_failed(pool, task_row["id"], reason)
+        print(f"  <- '{task_row['name']}' FAILED (no retries left): {reason}")
+    else:
+        await db.mark_task_for_retry(pool, task_row["id"], delay, reason)
+        attempt = task_row["retry_count"] + 1
+        print(
+            f"  <- '{task_row['name']}' failed, retrying in {delay}s "
+            f"(retry {attempt}/{task_row['max_retries']}): {reason}"
+        )
 
 
 async def run_dag(pool, dag_run_id: int, poll_interval: float = 1.0) -> None:

@@ -18,8 +18,9 @@ Redis, locking) still comes later in Phase 3.
 | Run tasks concurrently | ✅ Phase 1 | `asyncio.create_task` |
 | Prevent double-execution | ✅ Phase 1 | atomic claim (`db.claim_task`); matters across *processes* in Phase 3 |
 | Failure propagation (a failed task doesn't hang the DAG) | ✅ Phase 2 | doomed tasks marked `blocked`; `graph.compute_blocked_tasks` |
-| Retry on failure | ⬜ Phase 2 | not started |
-| Timeout on stuck tasks | ⬜ Phase 2 | not started |
+| Retry on failure (exponential backoff) | ✅ Phase 2 | per-task `max_retries`; policy in `src/retry.py`, backoff gate in `db.claim_task` |
+| Timeout on slow tasks | ✅ Phase 2 | per-task `timeout_seconds` via `asyncio.wait_for`; a timeout funnels into retry→fail→block |
+| Reclaim tasks orphaned by a dead worker | ⬜ Phase 3 | needs leases/heartbeats; only meaningful with multiple workers |
 | Multiple worker processes/machines | ⬜ Phase 3 | Redis-backed queue |
 | Web dashboard | ⬜ Phase 4 | — |
 
@@ -29,19 +30,24 @@ Redis, locking) still comes later in Phase 3.
 distributed-task-scheduler/
 ├── docker-compose.yml       # Postgres for local dev
 ├── migrations/
-│   ├── 001_init_schema.sql       # dag_runs / tasks / task_dependencies tables
-│   └── 002_add_blocked_status.sql # Phase 2: adds the 'blocked' task status
+│   ├── 001_init_schema.sql        # dag_runs / tasks / task_dependencies tables
+│   ├── 002_add_blocked_status.sql # Phase 2: adds the 'blocked' task status
+│   ├── 003_add_retry_columns.sql  # Phase 2: max_retries / retry_count / next_retry_at
+│   └── 004_add_timeout.sql        # Phase 2: timeout_seconds
 ├── src/
 │   ├── config.py            # reads DATABASE_URL from .env
 │   ├── models.py            # TaskStatus enum — the vocabulary everything shares
 │   ├── graph.py              # PURE logic: which tasks are ready / which are blocked? (no DB, unit-testable)
+│   ├── retry.py              # PURE logic: retry policy / backoff delay (no DB, unit-testable)
 │   ├── task_registry.py     # maps task_type strings -> Python functions
 │   ├── db.py                 # the only file that talks to Postgres
 │   ├── dag.py                 # helper to build a DAG from a list of task defs
 │   └── scheduler.py         # the polling loop that ties it all together
 ├── examples/
 │   ├── etl_dag.py            # runnable example: extract -> transform -> validate -> load
-│   └── failing_dag.py        # Phase 2 demo: a failing task blocks its descendants, DAG still finishes
+│   ├── failing_dag.py        # Phase 2 demo: a failing task blocks its descendants, DAG still finishes
+│   ├── retry_dag.py          # Phase 2 demo: a flaky task fails, backs off, recovers on retry
+│   └── timeout_dag.py        # Phase 2 demo: a slow task times out, retries, then fails and blocks
 ├── scripts/
 │   └── migrate.py            # applies migrations/*.sql without needing the psql CLI
 └── tests/
@@ -107,6 +113,49 @@ python -m examples.failing_dag
   ~ 'load' blocked (upstream failed)
 [scheduler] dag_run=... finished        # exits cleanly — no Ctrl+C needed
 ```
+
+### Seeing retry with backoff (Phase 2)
+
+`examples/retry_dag.py` has a `flaky` task (registered with `max_retries: 3`) that
+raises on its first two attempts and succeeds on the third. Instead of failing the
+DAG, the scheduler retries it with exponential backoff, then carries on:
+
+```bash
+python -m examples.retry_dag
+```
+```
+    (flaky attempt #1)
+  <- 'flaky' failed, retrying in 1.0s (retry 1/3): transient glitch on attempt 1
+    (flaky attempt #2)
+  <- 'flaky' failed, retrying in 2.0s (retry 2/3): transient glitch on attempt 2
+    (flaky attempt #3)
+  <- 'flaky' succeeded: {'succeeded_on_attempt': 3}
+  -> running 'finalize' ...
+[scheduler] dag_run=... finished
+```
+
+Set `max_retries` per task in its `task_defs` entry; it defaults to `0` (no retry).
+
+### Seeing timeout (Phase 2)
+
+`examples/timeout_dag.py` has a `slow` task that sleeps 3s but is given
+`timeout_seconds: 1` and `max_retries: 1`. Every attempt overruns and is cancelled,
+so it times out, retries once, times out again, fails, and blocks its dependent —
+timeout, retry, and failure propagation all composing on one task:
+
+```bash
+python -m examples.timeout_dag
+```
+```
+  <- 'slow' failed, retrying in 1.0s (retry 1/1): timed out after 1s
+  <- 'slow' FAILED (no retries left): timed out after 1s
+  ~ 'report' blocked (upstream failed)
+[scheduler] dag_run=... finished
+```
+
+Set `timeout_seconds` per task in its `task_defs` entry; it defaults to no limit.
+Note this bounds *slow-but-alive* tasks; reclaiming a task orphaned in `running` by
+a crashed worker needs leases and comes in Phase 3.
 
 ### Re-running from scratch
 

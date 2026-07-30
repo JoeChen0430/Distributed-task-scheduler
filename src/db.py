@@ -29,14 +29,21 @@ async def create_dag_run(pool: asyncpg.Pool, name: str) -> int:
     return row["id"]
 
 
-async def create_task(pool: asyncpg.Pool, dag_run_id: int, name: str, task_type: str) -> int:
+async def create_task(
+    pool: asyncpg.Pool,
+    dag_run_id: int,
+    name: str,
+    task_type: str,
+    max_retries: int = 0,
+    timeout_seconds: int | None = None,
+) -> int:
     row = await pool.fetchrow(
         """
-        INSERT INTO tasks (dag_run_id, name, task_type)
-        VALUES ($1, $2, $3)
+        INSERT INTO tasks (dag_run_id, name, task_type, max_retries, timeout_seconds)
+        VALUES ($1, $2, $3, $4, $5)
         RETURNING id
         """,
-        dag_run_id, name, task_type,
+        dag_run_id, name, task_type, max_retries, timeout_seconds,
     )
     return row["id"]
 
@@ -80,13 +87,20 @@ async def claim_task(pool: asyncpg.Pool, task_id: int) -> dict | None:
     Right now there's only ever one worker (this process), so the race can't
     actually happen yet — but writing it this way means Phase 3 (multiple
     worker processes) needs zero changes here to stay correct.
+
+    Phase 2 backoff gate: a task awaiting a retry is 'pending' but carries a
+    future next_retry_at. The extra WHERE clause keeps such a task unclaimable
+    until its backoff expires (compared against the DB clock), so exponential
+    backoff needs no timing logic in the scheduler or graph — a task in backoff
+    simply returns None here, exactly like one another worker already claimed.
     """
     row = await pool.fetchrow(
         """
         UPDATE tasks
         SET status = 'running', started_at = now()
         WHERE id = $1 AND status = 'pending'
-        RETURNING id, name, task_type, status
+          AND (next_retry_at IS NULL OR next_retry_at <= now())
+        RETURNING id, name, task_type, status, retry_count, max_retries, timeout_seconds
         """,
         task_id,
     )
@@ -112,6 +126,30 @@ async def mark_task_failed(pool: asyncpg.Pool, task_id: int, error: str) -> None
         WHERE id = $1
         """,
         task_id, error,
+    )
+
+
+async def mark_task_for_retry(
+    pool: asyncpg.Pool, task_id: int, delay_seconds: float, error: str
+) -> None:
+    """Send a failed-but-retryable task back to pending with a backoff deadline.
+
+    Bumps retry_count, records the error from this attempt, and sets next_retry_at
+    to now() + delay so claim_task won't pick it up again until the backoff passes.
+    started_at is cleared because the next attempt hasn't started yet — claim_task
+    stamps it fresh when the retry actually runs.
+    """
+    await pool.execute(
+        """
+        UPDATE tasks
+        SET status = 'pending',
+            retry_count = retry_count + 1,
+            next_retry_at = now() + make_interval(secs => $2),
+            error = $3,
+            started_at = NULL
+        WHERE id = $1
+        """,
+        task_id, delay_seconds, error,
     )
 
 

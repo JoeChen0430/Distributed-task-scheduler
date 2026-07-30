@@ -11,20 +11,28 @@ async def create_dag(pool, dag_name: str, task_defs: list[dict]) -> int:
     task_defs example:
         [
             {"name": "extract",   "task_type": "extract",   "depends_on": []},
-            {"name": "transform", "task_type": "transform", "depends_on": ["extract"]},
+            {"name": "transform", "task_type": "transform", "depends_on": ["extract"], "max_retries": 3, "timeout_seconds": 30},
             {"name": "validate",  "task_type": "validate",  "depends_on": ["transform"]},
             {"name": "load",      "task_type": "load",      "depends_on": ["validate"]},
         ]
 
     `name` must be unique within this DAG. `depends_on` refers to other
     `name` values, not ids — this function resolves that mapping for you.
-    Returns the new dag_run's id.
+    `max_retries` (default 0 = no retry) and `timeout_seconds` (default None =
+    no limit) are optional per task. Returns the new dag_run's id.
     """
     dag_run_id = await db.create_dag_run(pool, dag_name)
 
     name_to_id: dict[str, int] = {}
     for task_def in task_defs:
-        task_id = await db.create_task(pool, dag_run_id, task_def["name"], task_def["task_type"])
+        task_id = await db.create_task(
+            pool,
+            dag_run_id,
+            task_def["name"],
+            task_def["task_type"],
+            max_retries=task_def.get("max_retries", 0),
+            timeout_seconds=task_def.get("timeout_seconds"),
+        )
         name_to_id[task_def["name"]] = task_id
 
     for task_def in task_defs:

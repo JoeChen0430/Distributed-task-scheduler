@@ -1,0 +1,13 @@
+-- Phase 2: per-task timeout.
+--
+-- timeout_seconds bounds how long a handler may run. The scheduler wraps the
+-- handler in asyncio.wait_for(...), so a task that overruns is cancelled and
+-- treated as a failure — which then flows into the same retry/backoff path, and
+-- ultimately failure propagation, as any other failure.
+--
+-- NULL means "no timeout" (the default), so existing tasks are unaffected. This
+-- covers the "slow but still-alive task" case only; reclaiming an orphaned task
+-- left in 'running' by a dead process is cross-process work and belongs to Phase 3.
+--
+-- IF NOT EXISTS keeps re-applying this one file harmless (runner isn't versioned).
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS timeout_seconds INTEGER;

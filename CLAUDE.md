@@ -9,10 +9,10 @@ Distributed Task Scheduler — a DAG-based task scheduler (simplified Airflow), 
 This project is deliberately built phase-by-phase. **Don't skip ahead or add later-phase features early**, even if it would make the code more "complete" — that defeats the point of the exercise. If you're working on something and notice a gap that belongs to a later phase, flag it, don't fix it inline.
 
 - **Phase 1 (single-process): done.** Scheduler runs a DAG end-to-end on one machine.
-- **Phase 2 (retry, timeout, failure propagation): in progress.**
+- **Phase 2 (retry, timeout, failure propagation): done.**
   - ✅ Failure propagation: failed task's descendants are marked `BLOCKED` (a terminal status) so the DAG finishes instead of hanging. See `graph.compute_blocked_tasks`.
-  - ⬜ Retry (with backoff): not started.
-  - ⬜ Timeout on stuck tasks: not started.
+  - ✅ Retry (with exponential backoff): a handler failure is retried up to `max_retries` times before becoming a real `failed`. Policy is pure logic in `src/retry.py`; backoff is enforced by a `next_retry_at` gate inside `db.claim_task`. See `examples/retry_dag.py`.
+  - ✅ Timeout: per-task `timeout_seconds` bounds handler runtime via `asyncio.wait_for` in `scheduler.execute_task`; a timeout funnels into the same retry→fail→block path as any failure. Covers slow-but-alive tasks only — reclaiming tasks orphaned in `running` by a dead process needs leases and is Phase 3. See `examples/timeout_dag.py`.
 - **Phase 3 (multi-worker via Redis): not started.**
 - **Phase 4 (React dashboard): not started.**
 - **Phase 5 (benchmark): not started.**
@@ -40,7 +40,8 @@ docker compose down -v && docker compose up -d && python -m scripts.migrate
 
 ## Architecture — keep this separation
 
-- `src/graph.py` — pure logic only. No asyncpg, no async/await, no I/O. It answers "given these statuses and edges, which tasks are ready?" as plain Python in/out. This is what makes `tests/test_graph.py` runnable without a database. Do not add DB calls here.
+- `src/graph.py` — pure logic only. No asyncpg, no async/await, no I/O. It answers "given these statuses and edges, which tasks are ready / which are blocked?" as plain Python in/out. This is what makes `tests/test_graph.py` runnable without a database. Do not add DB calls here.
+- `src/retry.py` — pure retry policy (same rule as graph.py: no I/O, unit-tested in `tests/test_retry.py`). `plan_retry(retry_count, max_retries)` returns the backoff delay or `None` when retries are exhausted. Keep timing/DB out of here.
 - `src/db.py` — the only file that talks to Postgres. If you're writing SQL anywhere else, stop and move it here instead.
 - `src/scheduler.py` — orchestration only. Wires `graph.py` decisions to `db.py` persistence. No business logic of its own.
 - `src/task_registry.py` — maps `task_type` strings to handler functions via `@register_task("name")`. New task types register here, not by editing the scheduler.
@@ -54,7 +55,7 @@ Previously a failed task left its descendants stuck in `PENDING` forever and `ru
 
 1. Write an `async def handler(ctx: dict) -> dict` function.
 2. Register it with `@register_task("your_type_name")` above the function.
-3. Reference `"your_type_name"` in a `task_defs` list when building a DAG (see `examples/etl_dag.py`).
+3. Reference `"your_type_name"` in a `task_defs` list when building a DAG (see `examples/etl_dag.py`). Optionally add `"max_retries": N` (default 0 = no retry) and/or `"timeout_seconds": N` (default None = no limit) to that task def.
 4. No changes needed to `scheduler.py` or `db.py`.
 
 ## Testing
