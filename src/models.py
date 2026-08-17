@@ -14,6 +14,8 @@ from enum import Enum
 
 class TaskStatus(str, Enum):
     PENDING = "pending"    # created, waiting on dependencies
+    QUEUED = "queued"      # ready and pushed to the Redis queue, awaiting a worker.
+                           # Phase 3 — the dispatcher flips pending -> queued.
     RUNNING = "running"    # claimed by a worker, currently executing
     SUCCESS = "success"    # finished without raising
     FAILED = "failed"      # finished by raising an exception

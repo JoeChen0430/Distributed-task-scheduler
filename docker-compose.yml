@@ -10,7 +10,12 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
 
-# Phase 3 will add a `redis:` service here for the distributed queue.
+  # Phase 3: the distributed work queue. Ephemeral on purpose — Postgres is the
+  # source of truth for task state, so a lost queue is rebuilt from task rows.
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
 
 volumes:
   pgdata:
