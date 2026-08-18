@@ -27,6 +27,16 @@ async def get_client() -> redis.Redis:
     return _client
 
 
+async def aclose() -> None:
+    """Close the shared Redis client. Call on shutdown so its socket is released
+    before the event loop closes (otherwise redis-py's __del__ fires too late and
+    prints a harmless-but-noisy 'Event loop is closed' traceback)."""
+    global _client
+    if _client is not None:
+        await _client.aclose()
+        _client = None
+
+
 async def enqueue(task_id: int) -> None:
     """Push a ready task id onto the queue (called by the dispatcher)."""
     client = await get_client()

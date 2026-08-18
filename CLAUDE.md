@@ -11,9 +11,13 @@ This project is deliberately built phase-by-phase. **Don't skip ahead or add lat
 - **Phase 1 (single-process): done.** Scheduler runs a DAG end-to-end on one machine.
 - **Phase 2 (retry, timeout, failure propagation): done.**
   - ✅ Failure propagation: failed task's descendants are marked `BLOCKED` (a terminal status) so the DAG finishes instead of hanging. See `graph.compute_blocked_tasks`.
-  - ✅ Retry (with exponential backoff): a handler failure is retried up to `max_retries` times before becoming a real `failed`. Policy is pure logic in `src/retry.py`; backoff is enforced by a `next_retry_at` gate inside `db.claim_task`. See `examples/retry_dag.py`.
-  - ✅ Timeout: per-task `timeout_seconds` bounds handler runtime via `asyncio.wait_for` in `scheduler.execute_task`; a timeout funnels into the same retry→fail→block path as any failure. Covers slow-but-alive tasks only — reclaiming tasks orphaned in `running` by a dead process needs leases and is Phase 3. See `examples/timeout_dag.py`.
-- **Phase 3 (multi-worker via Redis): not started.**
+  - ✅ Retry (with exponential backoff): a handler failure is retried up to `max_retries` times before becoming a real `failed`. Policy is pure logic in `src/retry.py`; backoff is enforced by a `next_retry_at` gate (now inside `db.enqueue_task`, moved there in Phase 3). See `examples/retry_dag.py`.
+  - ✅ Timeout: per-task `timeout_seconds` bounds handler runtime via `asyncio.wait_for` in `worker.execute_task`; a timeout funnels into the same retry→fail→block path as any failure. Covers slow-but-alive tasks; reclaiming tasks orphaned in `running` by a dead worker is Phase 3 (leases). See `examples/timeout_dag.py`.
+- **Phase 3 (multi-worker via Redis): in progress.** Design in `docs/phase3-design.md`.
+  - ✅ M1 plumbing: `src/queue.py` (the only file that talks to Redis), `queued` status, lease columns, redis service.
+  - ✅ M2 split: `src/dispatcher.py` (decide ready → atomic `pending→queued` via `db.enqueue_task` → LPUSH) + `src/worker.py` (BRPOP → `db.claim_task` `queued→running` → execute). `scheduler.run_dag` is now a thin local orchestrator running a dispatcher + N in-process workers; examples are unchanged. See `examples/parallel_dag.py`.
+  - ✅ M3 leases: `claim_task` takes a lease (`lease_expires_at`/`worker_id`); workers heartbeat via `db.heartbeat_task`; the dispatcher's reaper (`dispatcher.reap_expired_leases` + `db.fetch_expired_leases`) reclaims tasks whose worker died, funnelling them through `plan_retry`. See `examples/reaper_demo.py`.
+  - ⬜ M4: integration tests + a true multi-process demo (workers need the task handlers imported into their own process — the registry isn't shared over Redis).
 - **Phase 4 (React dashboard): not started.**
 - **Phase 5 (benchmark): not started.**
 
@@ -43,7 +47,10 @@ docker compose down -v && docker compose up -d && python -m scripts.migrate
 - `src/graph.py` — pure logic only. No asyncpg, no async/await, no I/O. It answers "given these statuses and edges, which tasks are ready / which are blocked?" as plain Python in/out. This is what makes `tests/test_graph.py` runnable without a database. Do not add DB calls here.
 - `src/retry.py` — pure retry policy (same rule as graph.py: no I/O, unit-tested in `tests/test_retry.py`). `plan_retry(retry_count, max_retries)` returns the backoff delay or `None` when retries are exhausted. Keep timing/DB out of here.
 - `src/db.py` — the only file that talks to Postgres. If you're writing SQL anywhere else, stop and move it here instead.
-- `src/scheduler.py` — orchestration only. Wires `graph.py` decisions to `db.py` persistence. No business logic of its own.
+- `src/queue.py` — the only file that talks to Redis (the Phase 3 counterpart to `db.py`). Enqueue/dequeue the work queue; nothing else should import `redis`.
+- `src/dispatcher.py` — decides what's ready and enqueues it; also blocked-propagation, DAG-done detection, and the lease reaper. Never runs a handler.
+- `src/worker.py` — pulls ids off the queue, claims them, and runs handlers (`execute_task` lives here). Dumb executor: no DAG reasoning.
+- `src/scheduler.py` — thin local orchestrator: `run_dag` runs a dispatcher + N in-process workers so examples/tests run in one command. The same dispatcher/worker also run as separate processes.
 - `src/task_registry.py` — maps `task_type` strings to handler functions via `@register_task("name")`. New task types register here, not by editing the scheduler.
 - Task status strings always come from `src.models.TaskStatus` — never hardcode `"pending"` / `"success"` etc. as bare strings in new code.
 
@@ -65,14 +72,13 @@ Previously a failed task left its descendants stuck in `PENDING` forever and `ru
 
 ## Conventions
 
-- Async everywhere in `src/` and `examples/` — no blocking calls inside handlers or the scheduler loop.
+- Async everywhere in `src/` and `examples/` — no blocking calls inside handlers or the dispatcher/worker loops.
 - Run scripts as modules from the project root (`python -m examples.etl_dag`, not `python examples/etl_dag.py`) so `from src import ...` resolves correctly.
-- Keep `docker-compose.yml` Postgres-only until Phase 3 adds Redis — don't add other services speculatively.
+- `docker-compose.yml` now runs Postgres + Redis (Phase 3). Don't add further services speculatively.
 
 ## Out of scope for now
 
 Deferred on purpose, not forgotten — don't add unless the roadmap explicitly moves to that phase:
-- Retry / exponential backoff / timeouts (Phase 2)
-- Multiple worker processes, Redis, distributed locking (Phase 3)
+- Phase 3 remaining (M4): integration tests against Docker Postgres+Redis, a true multi-process demo, dispatcher HA/leader election, Redis persistence, task priorities.
 - Any frontend/UI (Phase 4)
 - Formal benchmarking (Phase 5)

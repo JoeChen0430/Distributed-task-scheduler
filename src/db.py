@@ -73,38 +73,101 @@ async def fetch_dag_state(pool: asyncpg.Pool, dag_run_id: int) -> tuple[list[dic
     return [dict(r) for r in task_rows], [dict(r) for r in dep_rows]
 
 
-async def claim_task(pool: asyncpg.Pool, task_id: int) -> dict | None:
-    """
-    Atomically flip a task from pending -> running, and only return it if
-    THIS call was the one that did the flipping.
+async def enqueue_task(pool: asyncpg.Pool, task_id: int) -> bool:
+    """Atomically move a ready task pending -> queued. Returns True iff THIS call
+    won the flip (so the dispatcher knows to actually LPUSH the id to Redis).
 
-    Why not just "SELECT the task, check it's pending, then run it"? Because
-    between the SELECT and the UPDATE, another worker could do the exact same
-    thing — that's a race condition, and it's the single most common bug in
-    homemade schedulers. The WHERE status = 'pending' inside the UPDATE makes
-    the check-and-flip one atomic operation instead of two separate steps.
+    This is the dispatcher's half of the claim dance. compute_ready_tasks keeps
+    returning a task every loop until it leaves 'pending', so this atomic transition
+    is what guarantees each ready task is enqueued EXACTLY ONCE even if the dispatcher
+    loops several times before a worker picks it up.
 
-    Right now there's only ever one worker (this process), so the race can't
-    actually happen yet — but writing it this way means Phase 3 (multiple
-    worker processes) needs zero changes here to stay correct.
-
-    Phase 2 backoff gate: a task awaiting a retry is 'pending' but carries a
-    future next_retry_at. The extra WHERE clause keeps such a task unclaimable
-    until its backoff expires (compared against the DB clock), so exponential
-    backoff needs no timing logic in the scheduler or graph — a task in backoff
-    simply returns None here, exactly like one another worker already claimed.
+    The Phase 2 backoff gate lives here (not in claim_task) because the dispatcher is
+    what decides when a retryable task becomes runnable again: a task awaiting a retry
+    is 'pending' with a future next_retry_at, and this WHERE clause keeps it out of
+    the queue until its backoff expires (measured against the DB clock).
     """
     row = await pool.fetchrow(
         """
         UPDATE tasks
-        SET status = 'running', started_at = now()
+        SET status = 'queued'
         WHERE id = $1 AND status = 'pending'
           AND (next_retry_at IS NULL OR next_retry_at <= now())
-        RETURNING id, name, task_type, status, retry_count, max_retries, timeout_seconds
+        RETURNING id
         """,
         task_id,
     )
+    return row is not None
+
+
+async def claim_task(
+    pool: asyncpg.Pool, task_id: int, worker_id: str, lease_ttl_seconds: float
+) -> dict | None:
+    """
+    Atomically flip a task from queued -> running, and only return it if THIS call
+    was the one that did the flipping.
+
+    A worker pops a task id off the Redis queue and calls this. Why not "SELECT to
+    check it's still queued, then UPDATE"? Because between the two, another worker
+    could do the same — a race condition, the single most common bug in homemade
+    schedulers. Putting WHERE status = 'queued' inside the UPDATE makes the
+    check-and-flip one atomic operation, so only one worker's UPDATE wins; the loser
+    gets None and drops the id.
+
+    This is the real guard against double-execution across processes. Redis BRPOP
+    already hands each id to just one worker, but this stays correct even when that
+    isn't enough — e.g. the reaper re-enqueues a task that a slow-but-alive worker
+    still holds. Written back in Phase 1, load-bearing now.
+
+    Claiming also takes a lease: worker_id records who holds the task and
+    lease_expires_at is when that hold expires. The worker heartbeats to extend it;
+    if the worker dies, the lease lapses and the reaper reclaims the task.
+    """
+    row = await pool.fetchrow(
+        """
+        UPDATE tasks
+        SET status = 'running', started_at = now(),
+            worker_id = $2,
+            lease_expires_at = now() + make_interval(secs => $3)
+        WHERE id = $1 AND status = 'queued'
+        RETURNING id, name, task_type, status, retry_count, max_retries, timeout_seconds
+        """,
+        task_id, worker_id, lease_ttl_seconds,
+    )
     return dict(row) if row else None
+
+
+async def heartbeat_task(pool: asyncpg.Pool, task_id: int, lease_ttl_seconds: float) -> None:
+    """Extend a running task's lease — the worker's "I'm still alive" signal.
+
+    Guarded by status = 'running' so it's a no-op once the task has finished (the
+    heartbeat loop and the task completing can race; this makes the loser harmless).
+    """
+    await pool.execute(
+        """
+        UPDATE tasks
+        SET lease_expires_at = now() + make_interval(secs => $2)
+        WHERE id = $1 AND status = 'running'
+        """,
+        task_id, lease_ttl_seconds,
+    )
+
+
+async def fetch_expired_leases(pool: asyncpg.Pool, dag_run_id: int) -> list[dict]:
+    """Running tasks in this dag_run whose lease has lapsed — their worker is
+    presumed dead. Returns just the fields the reaper needs to apply the retry
+    policy. Scoped to one dag_run so each dispatcher only reaps its own tasks.
+    """
+    rows = await pool.fetch(
+        """
+        SELECT id, name, retry_count, max_retries, worker_id
+        FROM tasks
+        WHERE dag_run_id = $1 AND status = 'running'
+          AND lease_expires_at IS NOT NULL AND lease_expires_at < now()
+        """,
+        dag_run_id,
+    )
+    return [dict(r) for r in rows]
 
 
 async def mark_task_success(pool: asyncpg.Pool, task_id: int, result: dict) -> None:

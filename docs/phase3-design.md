@@ -113,10 +113,10 @@ existing DB-free tests.
 
 ## Implementation milestones
 
-1. **Plumbing**: docker redis + `src/queue.py` + migration 005 + `QUEUED` status (enqueue/dequeue works).
-2. **Split**: dispatcher (enqueue) + worker (BRPOP→claim→execute); multiple workers run one DAG.
-3. **Orphan reclamation**: lease + heartbeat + reaper.
-4. **Integration tests + demo**: two workers don't double-execute; reaper reclaims an orphan; run a DAG across several workers.
+1. ✅ **Plumbing**: docker redis + `src/queue.py` + migration 005 + `QUEUED` status (enqueue/dequeue works).
+2. ✅ **Split**: dispatcher (enqueue) + worker (BRPOP→claim→execute); multiple workers run one DAG (`examples/parallel_dag.py`).
+3. ✅ **Orphan reclamation**: lease + heartbeat + reaper (`examples/reaper_demo.py`).
+4. ⬜ **Integration tests + true multi-process demo**: two workers don't double-execute; reaper reclaims an orphan; run a DAG across several *separate* worker processes (requires the workers to import the task handlers — the registry isn't shared over Redis).
 
 ## Verification (per milestone)
 

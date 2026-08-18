@@ -1,108 +1,41 @@
 """
-The scheduler loop, in plain words:
+Local orchestrator: run a whole dag_run in ONE process by starting a dispatcher and
+a few workers as coroutines, all coordinating through the Redis queue.
 
-  1. Ask the DB for every task's current status + the dependency edges.
-  2. Ask graph.py which pending tasks are now unblocked.
-  3. Try to claim each one (atomically) and fire it off concurrently.
-  4. Sleep briefly, repeat, until every task has finished.
+This is a convenience for examples and tests. The SAME dispatcher and worker code
+also run as separate processes for a real multi-machine setup:
+    python -m src.dispatcher <dag_run_id>
+    python -m src.worker w1        # ...and w2, w3, in other terminals
 
-This is intentionally a polling loop rather than something event-driven —
-polling is simple to reason about and is exactly what Phase 3 will swap out
-for a Redis-backed queue once this version's limits (see below) start to hurt.
+In Phase 1/2 this file held the entire single-process loop (decide + execute). Phase 3
+split that into dispatcher.py (decide + enqueue) and worker.py (dequeue + execute);
+run_dag just wires them together in-process.
 """
 
 import asyncio
 
-from src import db, graph, retry, task_registry
-from src.models import TaskStatus
+from src import queue
+from src.dispatcher import run_dispatcher
+from src.worker import run_worker
 
 
-async def execute_task(pool, task_row: dict) -> None:
-    """Run one task's handler and persist the outcome.
+async def run_dag(
+    pool, dag_run_id: int, poll_interval: float = 1.0, n_workers: int = 2
+) -> None:
+    """Drive one dag_run to completion with an in-process dispatcher + N workers.
 
-    A per-task timeout_seconds bounds how long the handler may run — asyncio
-    cancels it if it overruns (this only works while the handler awaits, i.e.
-    cooperative cancellation). A timeout and a raised exception both funnel into
-    the SAME path: retry with exponential backoff up to max_retries, and only
-    once retries are exhausted is the task marked FAILED for real (which is what
-    then triggers graph.compute_blocked_tasks to block its descendants).
+    The dispatcher returns once the DAG is finished (every task terminal, so no task
+    is queued or being executed). At that point the workers are idle, so we cancel
+    their infinite loops and wait for them to unwind.
     """
-    handler = task_registry.get_handler(task_row["task_type"])
-    timeout = task_row["timeout_seconds"]
-    print(f"  -> running '{task_row['name']}' (id={task_row['id']})")
+    workers = [
+        asyncio.create_task(run_worker(pool, f"w{i + 1}"))
+        for i in range(n_workers)
+    ]
     try:
-        coro = handler({"task": task_row})
-        if timeout is not None:
-            result = await asyncio.wait_for(coro, timeout=timeout)
-        else:
-            result = await coro
-        await db.mark_task_success(pool, task_row["id"], result or {})
-        print(f"  <- '{task_row['name']}' succeeded: {result}")
-        return
-    except asyncio.TimeoutError:
-        reason = f"timed out after {timeout}s"
-    except Exception as exc:
-        reason = str(exc)
-
-    # Reached only on failure/timeout — one shared decision: retry or give up.
-    delay = retry.plan_retry(task_row["retry_count"], task_row["max_retries"])
-    if delay is None:
-        await db.mark_task_failed(pool, task_row["id"], reason)
-        print(f"  <- '{task_row['name']}' FAILED (no retries left): {reason}")
-    else:
-        await db.mark_task_for_retry(pool, task_row["id"], delay, reason)
-        attempt = task_row["retry_count"] + 1
-        print(
-            f"  <- '{task_row['name']}' failed, retrying in {delay}s "
-            f"(retry {attempt}/{task_row['max_retries']}): {reason}"
-        )
-
-
-async def run_dag(pool, dag_run_id: int, poll_interval: float = 1.0) -> None:
-    """
-    Drive a single dag_run to completion.
-
-    NOTE — single-process only: `in_flight` lives in this process's memory,
-    so it only prevents double-claiming within THIS scheduler instance.
-    Two separate `run_dag` processes pointed at the same dag_run_id are
-    already safe from double-EXECUTION though, because db.claim_task()'s
-    atomic UPDATE is what actually prevents that — `in_flight` here is just
-    an optimization to avoid re-querying tasks this process already claimed.
-    """
-    print(f"[scheduler] watching dag_run={dag_run_id}")
-    in_flight: dict[int, asyncio.Task] = {}
-
-    while True:
-        tasks, deps = await db.fetch_dag_state(pool, dag_run_id)
-
-        # Phase 2 — failure propagation. Any pending task whose dependency has
-        # failed (or was itself blocked) can never become ready, so mark it
-        # blocked now. Without this a failed task leaves its descendants stuck in
-        # PENDING and the loop below would spin forever (the Phase 1 gap).
-        blocked_ids = graph.compute_blocked_tasks(tasks, deps)
-        if blocked_ids:
-            await db.mark_tasks_blocked(pool, blocked_ids)
-            newly_blocked = set(blocked_ids)
-            for t in tasks:
-                if t["id"] in newly_blocked:
-                    t["status"] = TaskStatus.BLOCKED.value  # keep local view in sync
-                    print(f"  ~ '{t['name']}' blocked (upstream failed)")
-
-        if graph.is_dag_finished(tasks) and not in_flight:
-            print(f"[scheduler] dag_run={dag_run_id} finished")
-            break
-
-        for task_id in graph.compute_ready_tasks(tasks, deps):
-            if task_id in in_flight:
-                continue
-            claimed = await db.claim_task(pool, task_id)
-            if claimed is None:
-                # Someone else (another worker, in Phase 3) already claimed it.
-                continue
-            in_flight[task_id] = asyncio.create_task(execute_task(pool, claimed))
-
-        for task_id in list(in_flight):
-            if in_flight[task_id].done():
-                del in_flight[task_id]
-
-        await asyncio.sleep(poll_interval)
+        await run_dispatcher(pool, dag_run_id, poll_interval=poll_interval)
+    finally:
+        for w in workers:
+            w.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        await queue.aclose()
