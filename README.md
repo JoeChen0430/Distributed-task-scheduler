@@ -1,57 +1,70 @@
-# Distributed Task Scheduler — Phase 2 (in progress)
+# Distributed Task Scheduler — Phase 3 (multi-worker)
 
 A minimal DAG-based task scheduler, built in phases so each distributed
 systems concept gets introduced one at a time instead of all at once.
 
-**Phase 1 (single-process, single-machine) is done**: define a DAG, resolve
-dependencies, run tasks in the right order, see status per task. **Phase 2 is
-now in progress** — hardening how the scheduler handles things going wrong,
-starting with failure propagation. The "distributed" part (multiple workers,
-Redis, locking) still comes later in Phase 3.
+**Phases 1–2 are done** (single-process core: DAG definition, dependency
+resolution, failure propagation, retry with backoff, timeouts). **Phase 3 is
+now multi-worker**: a dispatcher enqueues ready tasks to Redis and multiple
+worker processes pull them off and execute — safely, even when a worker dies
+mid-task (leases + a reaper reclaim it). Phase 4 (dashboard) and Phase 5
+(benchmark) are still to come.
 
 ## What works vs. what's coming later
 
 | Concept | Status | Notes |
 |---|---|---|
 | Define a DAG (tasks + dependencies) | ✅ Phase 1 | Postgres tables |
-| Resolve "what's ready to run" | ✅ Phase 1 | `src/graph.py` |
-| Run tasks concurrently | ✅ Phase 1 | `asyncio.create_task` |
-| Prevent double-execution | ✅ Phase 1 | atomic claim (`db.claim_task`); matters across *processes* in Phase 3 |
+| Resolve "what's ready to run" | ✅ Phase 1 | `src/graph.py` (pure logic) |
 | Failure propagation (a failed task doesn't hang the DAG) | ✅ Phase 2 | doomed tasks marked `blocked`; `graph.compute_blocked_tasks` |
-| Retry on failure (exponential backoff) | ✅ Phase 2 | per-task `max_retries`; policy in `src/retry.py`, backoff gate in `db.claim_task` |
-| Timeout on slow tasks | ✅ Phase 2 | per-task `timeout_seconds` via `asyncio.wait_for`; a timeout funnels into retry→fail→block |
-| Reclaim tasks orphaned by a dead worker | ⬜ Phase 3 | needs leases/heartbeats; only meaningful with multiple workers |
-| Multiple worker processes/machines | ⬜ Phase 3 | Redis-backed queue |
+| Retry on failure (exponential backoff) | ✅ Phase 2 | per-task `max_retries`; policy in `src/retry.py`, backoff gate in `db.enqueue_task` |
+| Timeout on slow tasks | ✅ Phase 2 | per-task `timeout_seconds` via `asyncio.wait_for`; funnels into retry→fail→block |
+| Multiple worker processes | ✅ Phase 3 | Redis work queue; dispatcher enqueues, workers `BRPOP` + atomic `db.claim_task` |
+| Prevent double-execution across processes | ✅ Phase 3 | atomic claim (`queued→running`) is the guard; the point of writing it in Phase 1 |
+| Reclaim tasks orphaned by a dead worker | ✅ Phase 3 | claim takes a lease; workers heartbeat; the dispatcher's reaper reclaims expired ones |
 | Web dashboard | ⬜ Phase 4 | — |
 
 ## Project structure
 
 ```
 distributed-task-scheduler/
-├── docker-compose.yml       # Postgres for local dev
+├── docker-compose.yml       # Postgres + Redis for local dev
+├── docs/
+│   └── phase3-design.md     # the multi-worker design (dispatcher/worker/queue/leases)
 ├── migrations/
-│   ├── 001_init_schema.sql        # dag_runs / tasks / task_dependencies tables
-│   ├── 002_add_blocked_status.sql # Phase 2: adds the 'blocked' task status
-│   ├── 003_add_retry_columns.sql  # Phase 2: max_retries / retry_count / next_retry_at
-│   └── 004_add_timeout.sql        # Phase 2: timeout_seconds
+│   ├── 001_init_schema.sql         # dag_runs / tasks / task_dependencies tables
+│   ├── 002_add_blocked_status.sql  # Phase 2: 'blocked' task status
+│   ├── 003_add_retry_columns.sql   # Phase 2: max_retries / retry_count / next_retry_at
+│   ├── 004_add_timeout.sql         # Phase 2: timeout_seconds
+│   └── 005_add_queue_and_lease.sql # Phase 3: 'queued' status + lease_expires_at / worker_id
 ├── src/
-│   ├── config.py            # reads DATABASE_URL from .env
+│   ├── config.py            # reads DATABASE_URL / REDIS_URL from .env
 │   ├── models.py            # TaskStatus enum — the vocabulary everything shares
-│   ├── graph.py              # PURE logic: which tasks are ready / which are blocked? (no DB, unit-testable)
-│   ├── retry.py              # PURE logic: retry policy / backoff delay (no DB, unit-testable)
+│   ├── graph.py             # PURE logic: which tasks are ready / which are blocked? (no DB)
+│   ├── retry.py             # PURE logic: retry policy / backoff delay (no DB)
 │   ├── task_registry.py     # maps task_type strings -> Python functions
-│   ├── db.py                 # the only file that talks to Postgres
-│   ├── dag.py                 # helper to build a DAG from a list of task defs
-│   └── scheduler.py         # the polling loop that ties it all together
+│   ├── db.py                # the only file that talks to Postgres
+│   ├── queue.py             # the only file that talks to Redis (the work queue)
+│   ├── dag.py               # helper to build a DAG from a list of task defs
+│   ├── dispatcher.py        # decides what's ready, enqueues it, propagates failure, reaps dead leases
+│   ├── worker.py            # pulls tasks off the queue, claims them, runs handlers
+│   └── scheduler.py         # local orchestrator: run one DAG with an in-process dispatcher + N workers
 ├── examples/
-│   ├── etl_dag.py            # runnable example: extract -> transform -> validate -> load
-│   ├── failing_dag.py        # Phase 2 demo: a failing task blocks its descendants, DAG still finishes
-│   ├── retry_dag.py          # Phase 2 demo: a flaky task fails, backs off, recovers on retry
-│   └── timeout_dag.py        # Phase 2 demo: a slow task times out, retries, then fails and blocks
+│   ├── etl_dag.py           # extract -> transform -> validate -> load
+│   ├── failing_dag.py       # Phase 2: a failing task blocks its descendants, DAG still finishes
+│   ├── retry_dag.py         # Phase 2: a flaky task fails, backs off, recovers on retry
+│   ├── timeout_dag.py       # Phase 2: a slow task times out, retries, then fails and blocks
+│   ├── parallel_dag.py      # Phase 3: two workers run parallel branches concurrently
+│   ├── reaper_demo.py       # Phase 3: a dead worker's task is reclaimed and rerun
+│   ├── demo_tasks.py        # shared handlers for the multi-process demo
+│   ├── create_demo_dag.py   # create the demo DAG only (for the multi-process demo)
+│   └── run_worker.py        # a standalone worker process that imports the demo handlers
 ├── scripts/
-│   └── migrate.py            # applies migrations/*.sql without needing the psql CLI
+│   └── migrate.py           # applies migrations/*.sql without needing the psql CLI
 └── tests/
-    └── test_graph.py          # tests for graph.py — no DB needed to run these
+    ├── test_graph.py        # pure dependency-resolution tests — no DB
+    ├── test_retry.py        # pure retry-policy tests — no DB
+    └── test_integration.py  # multi-worker tests against Docker Postgres+Redis (skip if down)
 ```
 
 ## Quick start
@@ -80,17 +93,20 @@ Expected output looks like:
 ```
 Created dag_run id=1
 
-[scheduler] watching dag_run=1
-  -> running 'extract' (id=1)
-  <- 'extract' succeeded: {'rows_extracted': 1000}
-  -> running 'transform' (id=2)
-  <- 'transform' succeeded: {'rows_transformed': 980}
-  -> running 'validate' (id=3)
-  <- 'validate' succeeded: {'valid': True}
-  -> running 'load' (id=4)
-  <- 'load' succeeded: {'rows_loaded': 980}
-[scheduler] dag_run=1 finished
+[dispatcher] watching dag_run=1
+  -> [w2] running 'extract' (id=1)
+  <- [w2] 'extract' succeeded: {'rows_extracted': 1000}
+  -> [w1] running 'transform' (id=2)
+  <- [w1] 'transform' succeeded: {'rows_transformed': 980}
+  -> [w2] running 'validate' (id=3)
+  <- [w2] 'validate' succeeded: {'valid': True}
+  -> [w1] running 'load' (id=4)
+  <- [w1] 'load' succeeded: {'rows_loaded': 980}
+[dispatcher] dag_run=1 finished
 ```
+
+The `[w1]`/`[w2]` tags are the two in-process workers `run_dag` starts by default —
+tasks are handed out through Redis, so which worker runs which task varies per run.
 
 Peek at the data directly any time with:
 ```bash
@@ -155,7 +171,44 @@ python -m examples.timeout_dag
 
 Set `timeout_seconds` per task in its `task_defs` entry; it defaults to no limit.
 Note this bounds *slow-but-alive* tasks; reclaiming a task orphaned in `running` by
-a crashed worker needs leases and comes in Phase 3.
+a crashed worker is handled by leases (Phase 3, below).
+
+### Seeing multiple workers (Phase 3)
+
+`examples/parallel_dag.py` fans out to two branches; the two in-process workers run
+them at the same time (`branch_a` on one worker, `branch_b` on the other):
+
+```bash
+python -m examples.parallel_dag
+```
+
+`examples/reaper_demo.py` forces a task into the state a *crashed* worker leaves
+behind (stuck `running`, expired lease) and shows the dispatcher's reaper reclaim it
+so a live worker reruns it:
+
+```bash
+python -m examples.reaper_demo
+```
+
+### Running in distributed (multi-process) mode
+
+`run_dag` above is a convenience that runs a dispatcher + workers in one process. The
+same code also runs as *separate* processes — the real distributed setup. Each worker
+process must import the task handlers itself (Redis only carries task ids, not code),
+which is what `examples/run_worker.py` does:
+
+```bash
+python -m examples.create_demo_dag     # prints: Created dag_run id=N
+python -m examples.run_worker w1       # in a second terminal (blocks, waiting)
+python -m examples.run_worker w2       # in a third terminal
+python -m src.dispatcher N             # drives dag_run N; workers pick up the tasks
+```
+
+Watch which worker ran what:
+```bash
+docker compose exec postgres psql -U scheduler -d scheduler -c \
+  "SELECT name, status, worker_id FROM tasks WHERE dag_run_id = N ORDER BY id;"
+```
 
 ### Re-running from scratch
 
@@ -173,8 +226,10 @@ python -m scripts.migrate
 ```bash
 python -m pytest tests/
 ```
-These only exercise `src/graph.py` — no Postgres needed, since that module
-takes plain dicts in and returns plain lists out.
+`test_graph.py` and `test_retry.py` are pure — plain dicts in, plain values out, no
+Postgres or Redis needed. `test_integration.py` exercises the multi-worker path
+against the Docker Postgres + Redis and **skips automatically** if they aren't
+running, so this command works either way.
 
 ## Two ideas worth understanding
 
