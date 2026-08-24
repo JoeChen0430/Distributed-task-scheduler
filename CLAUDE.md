@@ -22,7 +22,7 @@ This project is deliberately built phase-by-phase. **Don't skip ahead or add lat
   - Read-only FastAPI over the same Postgres (`src/api.py` → `db.list_dag_runs` / `db.fetch_dag_run_detail`); the dashboard is a pure observer — it never touches Redis, the queue, or execution.
   - React + Vite UI in `dashboard/`: runs list + per-run DAG graph (React Flow) and task table, polling the API every ~1s.
   - Write actions (trigger/retry/cancel from the UI) were deliberately left out — they'd couple the UI to the engine and need an always-on dispatcher. See the end of `docs/phase4-design.md`.
-- **Phase 5 (benchmark): not started.**
+- **Phase 5 (benchmark): done.** `benchmark/benchmark.py` drives the existing engine with no-op handlers (measures scheduler overhead, not work) and reads timestamps; sweeps worker count (wide DAG) and poll_interval (chain DAG). Findings in `docs/phase5-results.md`: chain latency is floored by `poll_interval` (makespan ≈ N × poll); wide throughput plateaus on Postgres round-trips + the single dispatcher, not worker count. No engine changes — `run_dag` already takes `n_workers`.
 
 Full phase breakdown and rationale: see README.md.
 
@@ -84,7 +84,7 @@ Previously a failed task left its descendants stuck in `PENDING` forever and `ru
 
 ## Out of scope for now
 
-Deferred on purpose, not forgotten — don't add unless the roadmap explicitly moves to that phase:
+All five roadmap phases are done. Things still deliberately NOT built (don't add unless asked):
 - Dashboard write actions (trigger/retry/cancel from the UI) — needs an always-on global dispatcher + worker pool, guarded atomic transitions, and auth. Would be a "Phase 4.5"; see end of `docs/phase4-design.md`.
-- Dispatcher HA/leader election, Redis persistence, task priorities (leftover Phase 3 niceties).
-- Formal benchmarking (Phase 5).
+- The optimizations the benchmark points at: separate-process workers for true scaling, batch enqueues, `SELECT ... FOR UPDATE SKIP LOCKED` bulk claims, event-driven (LISTEN/NOTIFY) instead of polling.
+- Dispatcher HA/leader election, Redis persistence, task priorities.
