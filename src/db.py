@@ -235,3 +235,81 @@ async def mark_tasks_blocked(pool: asyncpg.Pool, task_ids: list[int]) -> None:
         """,
         task_ids,
     )
+
+
+# --- Phase 4: read-only queries for the dashboard API (src/api.py) -------------
+# These only read; the dashboard is a pure observer over the same tables the
+# engine writes. Keep them here so all SQL still lives in one file.
+
+
+async def list_dag_runs(pool: asyncpg.Pool) -> list[dict]:
+    """Every dag_run, newest first, with a per-status task breakdown.
+
+    The overall run status is derived from the counts: anything still active
+    (pending/queued/running) -> "running"; else any failed/blocked -> "failed";
+    else all-success -> "success"; no tasks -> "empty".
+    """
+    rows = await pool.fetch(
+        """
+        SELECT r.id, r.name, r.created_at,
+               count(t.id)                                          AS total,
+               count(t.id) FILTER (WHERE t.status = 'success')      AS success,
+               count(t.id) FILTER (WHERE t.status = 'failed')       AS failed,
+               count(t.id) FILTER (WHERE t.status = 'blocked')      AS blocked,
+               count(t.id) FILTER (
+                   WHERE t.status IN ('pending', 'queued', 'running')
+               )                                                    AS active
+        FROM dag_runs r
+        LEFT JOIN tasks t ON t.dag_run_id = r.id
+        GROUP BY r.id, r.name, r.created_at
+        ORDER BY r.id DESC
+        """
+    )
+    runs = []
+    for r in rows:
+        d = dict(r)
+        if d["total"] == 0:
+            d["status"] = "empty"
+        elif d["active"] > 0:
+            d["status"] = "running"
+        elif d["failed"] > 0 or d["blocked"] > 0:
+            d["status"] = "failed"
+        else:
+            d["status"] = "success"
+        runs.append(d)
+    return runs
+
+
+async def fetch_dag_run_detail(pool: asyncpg.Pool, dag_run_id: int) -> dict | None:
+    """One run's full detail for the dashboard: run meta + tasks + dependency edges.
+    Returns None if the dag_run doesn't exist."""
+    run = await pool.fetchrow(
+        "SELECT id, name, created_at FROM dag_runs WHERE id = $1",
+        dag_run_id,
+    )
+    if run is None:
+        return None
+    task_rows = await pool.fetch(
+        """
+        SELECT id, name, task_type, status, retry_count, max_retries,
+               worker_id, started_at, finished_at, error
+        FROM tasks
+        WHERE dag_run_id = $1
+        ORDER BY id
+        """,
+        dag_run_id,
+    )
+    edge_rows = await pool.fetch(
+        """
+        SELECT d.task_id, d.depends_on_task_id
+        FROM task_dependencies d
+        JOIN tasks t ON t.id = d.task_id
+        WHERE t.dag_run_id = $1
+        """,
+        dag_run_id,
+    )
+    return {
+        "run": dict(run),
+        "tasks": [dict(r) for r in task_rows],
+        "edges": [dict(r) for r in edge_rows],
+    }

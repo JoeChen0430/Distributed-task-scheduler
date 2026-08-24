@@ -1,14 +1,14 @@
-# Distributed Task Scheduler — Phase 3 (multi-worker)
+# Distributed Task Scheduler — Phase 4 (dashboard)
 
 A minimal DAG-based task scheduler, built in phases so each distributed
 systems concept gets introduced one at a time instead of all at once.
 
-**Phases 1–2 are done** (single-process core: DAG definition, dependency
-resolution, failure propagation, retry with backoff, timeouts). **Phase 3 is
-now multi-worker**: a dispatcher enqueues ready tasks to Redis and multiple
-worker processes pull them off and execute — safely, even when a worker dies
-mid-task (leases + a reaper reclaim it). Phase 4 (dashboard) and Phase 5
-(benchmark) are still to come.
+**Phases 1–3 are done**: a single-process core (DAG definition, dependency
+resolution, failure propagation, retry with backoff, timeouts) that grew into a
+multi-worker engine — a dispatcher enqueues ready tasks to Redis, multiple worker
+processes execute them, and leases + a reaper reclaim tasks whose worker died.
+**Phase 4** adds a read-only React dashboard (a FastAPI API over the same
+Postgres) to watch runs live. Phase 5 (benchmark) is still to come.
 
 ## What works vs. what's coming later
 
@@ -22,7 +22,7 @@ mid-task (leases + a reaper reclaim it). Phase 4 (dashboard) and Phase 5
 | Multiple worker processes | ✅ Phase 3 | Redis work queue; dispatcher enqueues, workers `BRPOP` + atomic `db.claim_task` |
 | Prevent double-execution across processes | ✅ Phase 3 | atomic claim (`queued→running`) is the guard; the point of writing it in Phase 1 |
 | Reclaim tasks orphaned by a dead worker | ✅ Phase 3 | claim takes a lease; workers heartbeat; the dispatcher's reaper reclaims expired ones |
-| Web dashboard | ⬜ Phase 4 | — |
+| Web dashboard (live, read-only) | ✅ Phase 4 | FastAPI read API (`src/api.py`) + React/Vite UI (`dashboard/`), polling |
 
 ## Project structure
 
@@ -30,7 +30,8 @@ mid-task (leases + a reaper reclaim it). Phase 4 (dashboard) and Phase 5
 distributed-task-scheduler/
 ├── docker-compose.yml       # Postgres + Redis for local dev
 ├── docs/
-│   └── phase3-design.md     # the multi-worker design (dispatcher/worker/queue/leases)
+│   ├── phase3-design.md     # the multi-worker design (dispatcher/worker/queue/leases)
+│   └── phase4-design.md     # the dashboard design (read-only API + React)
 ├── migrations/
 │   ├── 001_init_schema.sql         # dag_runs / tasks / task_dependencies tables
 │   ├── 002_add_blocked_status.sql  # Phase 2: 'blocked' task status
@@ -48,7 +49,8 @@ distributed-task-scheduler/
 │   ├── dag.py               # helper to build a DAG from a list of task defs
 │   ├── dispatcher.py        # decides what's ready, enqueues it, propagates failure, reaps dead leases
 │   ├── worker.py            # pulls tasks off the queue, claims them, runs handlers
-│   └── scheduler.py         # local orchestrator: run one DAG with an in-process dispatcher + N workers
+│   ├── scheduler.py         # local orchestrator: run one DAG with an in-process dispatcher + N workers
+│   └── api.py               # Phase 4: read-only FastAPI over db.py (the dashboard's backend)
 ├── examples/
 │   ├── etl_dag.py           # extract -> transform -> validate -> load
 │   ├── failing_dag.py       # Phase 2: a failing task blocks its descendants, DAG still finishes
@@ -61,10 +63,12 @@ distributed-task-scheduler/
 │   └── run_worker.py        # a standalone worker process that imports the demo handlers
 ├── scripts/
 │   └── migrate.py           # applies migrations/*.sql without needing the psql CLI
-└── tests/
-    ├── test_graph.py        # pure dependency-resolution tests — no DB
-    ├── test_retry.py        # pure retry-policy tests — no DB
-    └── test_integration.py  # multi-worker tests against Docker Postgres+Redis (skip if down)
+├── tests/
+│   ├── test_graph.py        # pure dependency-resolution tests — no DB
+│   ├── test_retry.py        # pure retry-policy tests — no DB
+│   └── test_integration.py  # multi-worker tests against Docker Postgres+Redis (skip if down)
+└── dashboard/               # Phase 4: React + Vite read-only UI
+    └── src/                 # RunsList / RunDetail / DagGraph (React Flow), polling the API
 ```
 
 ## Quick start
@@ -209,6 +213,27 @@ Watch which worker ran what:
 docker compose exec postgres psql -U scheduler -d scheduler -c \
   "SELECT name, status, worker_id FROM tasks WHERE dag_run_id = N ORDER BY id;"
 ```
+
+### The dashboard (Phase 4)
+
+A read-only web UI to watch runs live: a list of DAG runs, and per-run a DAG graph
+(nodes colored by status) + a task table, all polling the API every ~1s. It reads the
+same Postgres the engine writes — it never touches Redis, the queue, or execution.
+
+Needs Node.js. In three terminals:
+```bash
+# 1. the read API (from the project root)
+uvicorn src.api:app --reload              # http://localhost:8000  (/docs for Swagger UI)
+
+# 2. the dashboard dev server
+cd dashboard && npm install && npm run dev # http://localhost:5173
+
+# 3. produce some live activity to watch
+python -m examples.parallel_dag           # or failing_dag / retry_dag / timeout_dag
+```
+Open http://localhost:5173, click a run, and watch task statuses move
+pending → queued → running → success/failed/blocked without reloading. Design:
+`docs/phase4-design.md`.
 
 ### Re-running from scratch
 

@@ -17,8 +17,11 @@ This project is deliberately built phase-by-phase. **Don't skip ahead or add lat
   - ✅ M1 plumbing: `src/queue.py` (the only file that talks to Redis), `queued` status, lease columns, redis service.
   - ✅ M2 split: `src/dispatcher.py` (decide ready → atomic `pending→queued` via `db.enqueue_task` → LPUSH) + `src/worker.py` (BRPOP → `db.claim_task` `queued→running` → execute). `scheduler.run_dag` is now a thin local orchestrator running a dispatcher + N in-process workers; examples are unchanged. See `examples/parallel_dag.py`.
   - ✅ M3 leases: `claim_task` takes a lease (`lease_expires_at`/`worker_id`); workers heartbeat via `db.heartbeat_task`; the dispatcher's reaper (`dispatcher.reap_expired_leases` + `db.fetch_expired_leases`) reclaims tasks whose worker died, funnelling them through `plan_retry`. See `examples/reaper_demo.py`.
-  - ⬜ M4: integration tests + a true multi-process demo (workers need the task handlers imported into their own process — the registry isn't shared over Redis).
-- **Phase 4 (React dashboard): not started.**
+  - ✅ M4: integration tests (`tests/test_integration.py`, skip if services down) + a true multi-process demo (`examples/create_demo_dag.py` + `run_worker.py`; workers must import the task handlers — the registry isn't shared over Redis).
+- **Phase 4 (React dashboard): done (read-only).** Design in `docs/phase4-design.md`.
+  - Read-only FastAPI over the same Postgres (`src/api.py` → `db.list_dag_runs` / `db.fetch_dag_run_detail`); the dashboard is a pure observer — it never touches Redis, the queue, or execution.
+  - React + Vite UI in `dashboard/`: runs list + per-run DAG graph (React Flow) and task table, polling the API every ~1s.
+  - Write actions (trigger/retry/cancel from the UI) were deliberately left out — they'd couple the UI to the engine and need an always-on dispatcher. See the end of `docs/phase4-design.md`.
 - **Phase 5 (benchmark): not started.**
 
 Full phase breakdown and rationale: see README.md.
@@ -31,10 +34,12 @@ source .venv/bin/activate         # or prefix commands with .venv/bin/python
 ```
 
 ```bash
-docker compose up -d              # start Postgres
+docker compose up -d              # start Postgres + Redis
 python -m scripts.migrate         # apply schema
-python -m examples.etl_dag        # run the sample DAG
-python -m pytest tests/           # run tests (no DB needed for tests/test_graph.py)
+python -m examples.etl_dag        # run the sample DAG (in-process dispatcher + workers)
+python -m pytest tests/           # pure tests always run; integration tests skip if services down
+uvicorn src.api:app --reload      # Phase 4 dashboard API on :8000
+cd dashboard && npm run dev        # Phase 4 dashboard UI on :5173 (needs Node)
 ```
 
 Reset from scratch (migrations aren't idempotent yet):
@@ -51,6 +56,7 @@ docker compose down -v && docker compose up -d && python -m scripts.migrate
 - `src/dispatcher.py` — decides what's ready and enqueues it; also blocked-propagation, DAG-done detection, and the lease reaper. Never runs a handler.
 - `src/worker.py` — pulls ids off the queue, claims them, and runs handlers (`execute_task` lives here). Dumb executor: no DAG reasoning.
 - `src/scheduler.py` — thin local orchestrator: `run_dag` runs a dispatcher + N in-process workers so examples/tests run in one command. The same dispatcher/worker also run as separate processes.
+- `src/api.py` — Phase 4 read-only FastAPI for the dashboard. Reads via `db.py` only (no SQL here); never touches Redis/queue/execution. The `dashboard/` React app (Vite) polls it. Keep write actions out (see Phase 4 status).
 - `src/task_registry.py` — maps `task_type` strings to handler functions via `@register_task("name")`. New task types register here, not by editing the scheduler.
 - Task status strings always come from `src.models.TaskStatus` — never hardcode `"pending"` / `"success"` etc. as bare strings in new code.
 
@@ -79,6 +85,6 @@ Previously a failed task left its descendants stuck in `PENDING` forever and `ru
 ## Out of scope for now
 
 Deferred on purpose, not forgotten — don't add unless the roadmap explicitly moves to that phase:
-- Phase 3 remaining (M4): integration tests against Docker Postgres+Redis, a true multi-process demo, dispatcher HA/leader election, Redis persistence, task priorities.
-- Any frontend/UI (Phase 4)
-- Formal benchmarking (Phase 5)
+- Dashboard write actions (trigger/retry/cancel from the UI) — needs an always-on global dispatcher + worker pool, guarded atomic transitions, and auth. Would be a "Phase 4.5"; see end of `docs/phase4-design.md`.
+- Dispatcher HA/leader election, Redis persistence, task priorities (leftover Phase 3 niceties).
+- Formal benchmarking (Phase 5).
