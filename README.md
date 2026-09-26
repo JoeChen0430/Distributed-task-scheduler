@@ -1,5 +1,7 @@
 # Distributed Task Scheduler
 
+![tests](https://github.com/JoeChen0430/Distributed-task-scheduler/actions/workflows/ci.yml/badge.svg)
+
 A minimal DAG-based task scheduler, built in phases so each distributed
 systems concept gets introduced one at a time instead of all at once.
 **All five phases are done.**
@@ -299,7 +301,9 @@ need to touch this function at all to become safe with multiple workers.
 
 - ~~A failed task hangs the DAG forever.~~ **Fixed in Phase 2** — doomed tasks
   are marked `blocked` (see `graph.compute_blocked_tasks`) so the run finishes.
-- No retry, no timeout — a slow or hung task just runs forever. (Next up in Phase 2.)
+- ~~No retry, no timeout — a slow or hung task just runs forever.~~ **Fixed in Phase 2** —
+  per-task `max_retries` (exponential backoff) and `timeout_seconds`; see `src/retry.py`
+  and `worker.execute_task`.
 - Migrations aren't versioned/idempotent, so applying a *new* migration means a
   reset (see "Re-running from scratch"). Individual files use `IF NOT EXISTS`
   where they can, but the runner still replays every file.
@@ -307,3 +311,7 @@ need to touch this function at all to become safe with multiple workers.
 None of these are bugs to panic about — they're the reason Phase 2 and 3
 exist. Building the naive version first, then noticing exactly where it
 breaks, is the point.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
